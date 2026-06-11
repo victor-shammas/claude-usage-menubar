@@ -23,11 +23,12 @@ echo ""
 
 # Install dependencies
 echo "Installing dependencies..."
-if pip3 install --user --break-system-packages -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+# Use $PYTHON -m pip so packages land in the same interpreter the LaunchAgent runs
+if "$PYTHON" -m pip install --user --break-system-packages -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
     true
-elif pip3 install --user -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+elif "$PYTHON" -m pip install --user -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
     true
-elif pip3 install -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+elif "$PYTHON" -m pip install -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
     true
 else
     echo "Error: Failed to install dependencies. Try manually:"

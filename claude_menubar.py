@@ -149,7 +149,8 @@ def pct_used(utilization):
 
 
 def bar(utilization, width=20):
-    """Render a text progress bar. utilization is 0–100."""
+    """Render a text progress bar. utilization is clamped to 0–100."""
+    utilization = min(100, max(0, utilization))
     used = round((utilization / 100) * width)
     return "█" * used + "░" * (width - used)
 
