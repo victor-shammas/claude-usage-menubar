@@ -148,6 +148,17 @@ def pct_used(utilization):
     return min(100, max(0, round(utilization)))
 
 
+def status_dot(utilization):
+    """Colored indicator for usage level."""
+    if utilization >= 90:
+        return "🔴"
+    if utilization >= 75:
+        return "🟠"
+    if utilization >= 50:
+        return "🟡"
+    return "🟢"
+
+
 def bar(utilization, width=20):
     """Render a text progress bar. utilization is clamped to 0–100."""
     utilization = min(100, max(0, utilization))
@@ -162,17 +173,23 @@ class ClaudeUsageApp(rumps.App):
         self.usage_data = None
         self.last_error = None
 
+        # Info rows get a no-op callback: callback-less items are disabled
+        # and macOS dims them (even re-enabling is undone by menu validation
+        # at popup time, since they have no action).
         self.menu = [
-            rumps.MenuItem("5-Hour Window", callback=None),
-            rumps.MenuItem("Weekly Quota", callback=None),
+            rumps.MenuItem("5-Hour Window", callback=self._noop),
+            rumps.MenuItem("Weekly Quota", callback=self._noop),
             None,
-            rumps.MenuItem("Last Updated: never", callback=None),
-            rumps.MenuItem("Refresh Now", callback=self.refresh),
+            rumps.MenuItem("Last Updated: never", callback=self._noop),
+            rumps.MenuItem("Refresh Now", callback=self.refresh, key="r"),
             None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
 
         self.refresh(None)
+
+    def _noop(self, _):
+        pass
 
     @rumps.timer(POLL_INTERVAL)
     def auto_refresh(self, _):
@@ -202,6 +219,38 @@ class ClaudeUsageApp(rumps.App):
             self.title = "err"
             self._update_menu_error()
 
+    def _set_item_title(self, name, text):
+        """Set a menu item's title in monospaced, full-contrast text.
+
+        The info rows are non-clickable, so macOS dims them; an attributed
+        title with an explicit color overrides that. Monospaced font keeps
+        the two progress bars aligned (the menu font is proportional, so
+        space-padding alone can't line them up).
+        """
+        item = self.menu[name]
+        item.title = text
+        try:
+            from AppKit import (
+                NSAttributedString,
+                NSColor,
+                NSFont,
+                NSFontAttributeName,
+                NSForegroundColorAttributeName,
+            )
+            font = NSFont.monospacedSystemFontOfSize_weight_(
+                NSFont.systemFontSize(), 0.0
+            )
+            attr = NSAttributedString.alloc().initWithString_attributes_(
+                text,
+                {
+                    NSFontAttributeName: font,
+                    NSForegroundColorAttributeName: NSColor.labelColor(),
+                },
+            )
+            item._menuitem.setAttributedTitle_(attr)
+        except Exception:
+            pass
+
     def _update_display(self):
         d = self.usage_data
         five = d.get("five_hour", {})
@@ -218,24 +267,28 @@ class ClaudeUsageApp(rumps.App):
         five_reset = format_time_remaining(five.get("resets_at", ""))
         week_reset = format_time_remaining(week.get("resets_at", ""))
 
-        self.menu["5-Hour Window"].title = (
-            f"5-Hour Window:  {bar(five_util, 15)}  "
-            f"{five_used}% used  (resets in {five_reset})"
+        self._set_item_title(
+            "5-Hour Window",
+            f"{status_dot(five_util)} 5-Hour Window:  {bar(five_util, 15)}  "
+            f"{five_used}% used  (resets in {five_reset})",
         )
-        self.menu["Weekly Quota"].title = (
-            f"Weekly Quota:   {bar(week_util, 15)}  "
-            f"{week_used}% used  (resets in {week_reset})"
+        self._set_item_title(
+            "Weekly Quota",
+            f"{status_dot(week_util)} Weekly Quota:   {bar(week_util, 15)}  "
+            f"{week_used}% used  (resets in {week_reset})",
         )
 
         now = datetime.now().strftime("%H:%M")
-        self.menu["Last Updated: never"].title = f"Last Updated: {now}"
+        self._set_item_title("Last Updated: never", f"Last Updated: {now}")
 
     def _update_menu_error(self):
         err = self.last_error or "Unknown error"
-        self.menu["5-Hour Window"].title = f"Error: {err}"
-        self.menu["Weekly Quota"].title = "—"
+        self._set_item_title("5-Hour Window", f"Error: {err}")
+        self._set_item_title("Weekly Quota", "—")
         now = datetime.now().strftime("%H:%M")
-        self.menu["Last Updated: never"].title = f"Last Updated: {now} (error)"
+        self._set_item_title(
+            "Last Updated: never", f"Last Updated: {now} (error)"
+        )
 
 
 if __name__ == "__main__":
