@@ -71,6 +71,12 @@ The app checks these locations in order (first match wins):
 
 Most users don't need to do anything — if Claude Code is installed and logged in, option 4 just works.
 
+### Token auto-refresh
+
+Claude Code's OAuth access tokens expire after ~8 hours, and normally only Claude Code itself renews them. For sources 3 and 4 the app renews the token itself when it expires (or when a request comes back 401), using the refresh token stored alongside it, and writes the rotated credentials back to the same store so Claude Code stays logged in. This means the widget keeps working even when you haven't opened Claude Code in days.
+
+Sources 1 and 2 are static tokens with no refresh token, so they still go stale — the app will show `err:401` when they do.
+
 ## How it works
 
 The app polls an undocumented Anthropic endpoint (`api.anthropic.com/api/oauth/usage`) every 5 minutes. This is the same endpoint Claude Code's internal HUD uses. It returns utilization percentages for the 5-hour rolling window and 7-day weekly cap.
@@ -101,9 +107,13 @@ claude /login
 
 Select **"Claude account with subscription"** (option 1). This requires a Pro, Max, Team, or Enterprise plan.
 
-**"err:403"**
+**"re-auth" in menu bar**
 
-Your token is expired or invalid. Re-authenticate with `claude /login`.
+The refresh token was rejected, so the app can't renew your access token. Re-authenticate with `claude /login`.
+
+**"err:401" or "err:403"**
+
+Your token is expired or invalid and couldn't be auto-refreshed (this is expected for static tokens from `CLAUDE_OAUTH_TOKEN` or `~/.claude_menubar.json`). Re-authenticate with `claude /login`, or update your static token.
 
 **"err:429"**
 

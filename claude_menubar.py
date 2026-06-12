@@ -3,11 +3,15 @@
 Claude Usage Menu Bar Widget
 Shows Claude's 5-hour rolling window and 7-day weekly quota in the macOS menu bar.
 
-Reads the OAuth token from (first match wins):
-  1. CLAUDE_OAUTH_TOKEN environment variable
-  2. ~/.claude_menubar.json  {"oauth_token": "..."}
+Reads OAuth credentials from (first match wins):
+  1. CLAUDE_OAUTH_TOKEN environment variable (static, no auto-refresh)
+  2. ~/.claude_menubar.json  {"oauth_token": "..."}  (static, no auto-refresh)
   3. ~/.claude/.credentials.json  (claudeAiOauth.accessToken)
   4. macOS Keychain ("Claude Code-credentials")
+
+For sources 3 and 4 the stored refresh token is used to renew the access
+token when it expires, and the rotated credentials are written back so
+Claude Code stays in sync.
 
 Requirements: pip install rumps pyobjc-framework-Cocoa
 """
@@ -15,6 +19,7 @@ Requirements: pip install rumps pyobjc-framework-Cocoa
 import json
 import os
 import subprocess
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -24,8 +29,21 @@ import rumps
 
 MENUBAR_CONFIG = Path.home() / ".claude_menubar.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+# Claude Code's public OAuth client id (same one the CLI uses for /login)
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 POLL_INTERVAL = 300  # seconds (5 minutes)
+EXPIRY_MARGIN = 60  # refresh this many seconds before expiresAt
+
+
+class NoTokenError(Exception):
+    pass
+
+
+class ReauthRequiredError(Exception):
+    pass
 
 
 def get_claude_code_version():
@@ -43,14 +61,12 @@ def get_claude_code_version():
     return "2.1.0"  # fallback
 
 
-def get_access_token():
-    """Read the OAuth access token. Checks multiple locations."""
-    # 1. Environment variable
+def get_static_token():
+    """Tokens supplied directly by the user; these can't be auto-refreshed."""
     token = os.environ.get("CLAUDE_OAUTH_TOKEN")
     if token:
         return token
 
-    # 2. Dedicated menubar config file
     if MENUBAR_CONFIG.exists():
         try:
             data = json.loads(MENUBAR_CONFIG.read_text())
@@ -60,44 +76,116 @@ def get_access_token():
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # 3. Claude Code credentials file
+    return None
+
+
+def _extract_oauth(data):
+    """Find the dict holding accessToken inside a credentials JSON blob."""
+    if not isinstance(data, dict):
+        return None
+    for outer in ("claudeAiOauth", "oauth"):
+        if isinstance(data.get(outer), dict) and data[outer].get("accessToken"):
+            return data[outer]
+    if data.get("accessToken"):
+        return data
+    return None
+
+
+def _file_read():
     if CREDENTIALS_PATH.exists():
         try:
-            data = json.loads(CREDENTIALS_PATH.read_text())
-            token = data.get("claudeAiOauth", {}).get("accessToken")
-            if token:
-                return token
-        except (json.JSONDecodeError, KeyError):
+            return json.loads(CREDENTIALS_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
             pass
+    return None
 
-    # 4. macOS Keychain
+
+def _file_write(data):
+    CREDENTIALS_PATH.write_text(json.dumps(data))
+    os.chmod(CREDENTIALS_PATH, 0o600)
+
+
+def _keychain_read():
     try:
-        user = os.environ.get("USER", "")
         result = subprocess.run(
             ["security", "find-generic-password",
-             "-s", "Claude Code-credentials", "-a", user, "-w"],
+             "-s", KEYCHAIN_SERVICE, "-a", os.environ.get("USER", ""), "-w"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            raw = result.stdout.strip()
-            try:
-                data = json.loads(raw)
-                # Nested: {"claudeAiOauth": {"accessToken": "..."}}
-                for outer in ("claudeAiOauth", "oauth"):
-                    if isinstance(data.get(outer), dict):
-                        for key in ("accessToken", "access_token", "token"):
-                            if key in data[outer]:
-                                return data[outer][key]
-                # Flat: {"accessToken": "..."}
-                for key in ("accessToken", "access_token", "token"):
-                    if key in data:
-                        return data[key]
-            except json.JSONDecodeError:
-                return raw
+            return json.loads(result.stdout.strip())
     except Exception:
         pass
-
     return None
+
+
+def _keychain_write(data):
+    subprocess.run(
+        ["security", "add-generic-password", "-U",
+         "-s", KEYCHAIN_SERVICE, "-a", os.environ.get("USER", ""),
+         "-w", json.dumps(data)],
+        capture_output=True, text=True, timeout=5,
+    )
+
+
+def load_credentials():
+    """Return (container, oauth, write_fn) from the first available store.
+
+    container is the full parsed JSON (what gets written back), oauth is
+    the nested dict holding accessToken/refreshToken/expiresAt.
+    """
+    for read_fn, write_fn in ((_file_read, _file_write),
+                              (_keychain_read, _keychain_write)):
+        container = read_fn()
+        oauth = _extract_oauth(container)
+        if oauth:
+            return container, oauth, write_fn
+    return None, None, None
+
+
+def token_expired(oauth):
+    expires_at = oauth.get("expiresAt")
+    if not expires_at:
+        return False
+    return time.time() >= expires_at / 1000 - EXPIRY_MARGIN
+
+
+def refresh_credentials(container, oauth, write_fn):
+    """Exchange the refresh token for a new access token and persist it.
+
+    Refresh tokens rotate: the response carries a replacement, and the old
+    one stops working. Persisting the rotated credentials back to the same
+    store is what keeps Claude Code's login valid.
+    """
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": oauth["refreshToken"],
+        "client_id": OAUTH_CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"claude-code/{_CC_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tok = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401, 403):
+            raise ReauthRequiredError(
+                "refresh token rejected — run: claude /login"
+            ) from e
+        raise
+
+    oauth["accessToken"] = tok["access_token"]
+    if tok.get("refresh_token"):
+        oauth["refreshToken"] = tok["refresh_token"]
+    if tok.get("expires_in"):
+        oauth["expiresAt"] = int((time.time() + tok["expires_in"]) * 1000)
+    write_fn(container)
 
 
 # Detect version once at startup
@@ -116,6 +204,39 @@ def fetch_usage(token):
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode())
+
+
+def get_usage():
+    """Fetch usage, refreshing the access token when needed."""
+    token = get_static_token()
+    if token:
+        return fetch_usage(token)
+
+    container, oauth, write_fn = load_credentials()
+    if not oauth:
+        raise NoTokenError()
+
+    if token_expired(oauth) and oauth.get("refreshToken"):
+        try:
+            refresh_credentials(container, oauth, write_fn)
+        except ReauthRequiredError:
+            raise
+        except Exception:
+            # Transient failure (e.g. the endpoint rate-limits refresh
+            # attempts while the token is still valid). The stored token
+            # may still work — fall through and try it; a 401 below
+            # retries the refresh and surfaces the real error.
+            pass
+
+    try:
+        return fetch_usage(oauth["accessToken"])
+    except urllib.error.HTTPError as e:
+        # Token may have been revoked before its expiry timestamp;
+        # try one refresh and retry.
+        if e.code == 401 and oauth.get("refreshToken"):
+            refresh_credentials(container, oauth, write_fn)
+            return fetch_usage(oauth["accessToken"])
+        raise
 
 
 def format_time_remaining(resets_at_str):
@@ -196,20 +317,21 @@ class ClaudeUsageApp(rumps.App):
         self.refresh(None)
 
     def refresh(self, _):
-        token = get_access_token()
-        if not token:
+        try:
+            self.usage_data = get_usage()
+            self.last_error = None
+            self._update_display()
+        except NoTokenError:
             self.title = "No token"
             self.last_error = (
                 "No OAuth token found. Log in with: claude /login "
                 "(select 'Claude account with subscription')"
             )
             self._update_menu_error()
-            return
-
-        try:
-            self.usage_data = fetch_usage(token)
-            self.last_error = None
-            self._update_display()
+        except ReauthRequiredError as e:
+            self.title = "re-auth"
+            self.last_error = str(e)
+            self._update_menu_error()
         except urllib.error.HTTPError as e:
             self.last_error = f"HTTP {e.code}"
             self.title = f"err:{e.code}"
