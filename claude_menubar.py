@@ -19,6 +19,7 @@ Requirements: pip install rumps pyobjc-framework-Cocoa
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -37,6 +38,36 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 POLL_INTERVAL = 300  # seconds (5 minutes)
 EXPIRY_MARGIN = 60  # refresh this many seconds before expiresAt
 
+# At login, launchd starts this app with a minimal PATH (typically just
+# /usr/bin:/bin:/usr/sbin:/sbin), so `claude` — installed under a user dir —
+# isn't found. We probe these locations explicitly so the User-Agent carries
+# a real claude-code version instead of the fallback (the usage endpoint
+# rate-limits unknown/old User-Agents more aggressively).
+CLAUDE_BIN_CANDIDATES = [
+    Path.home() / ".local" / "bin" / "claude",
+    Path.home() / ".claude" / "local" / "claude",
+    Path("/opt/homebrew/bin/claude"),
+    Path("/usr/local/bin/claude"),
+    Path.home() / ".npm-global" / "bin" / "claude",
+    Path.home() / "node_modules" / ".bin" / "claude",
+]
+
+# Startup self-heal: a fresh login often has a stale access token, and the
+# very first request can come back 429/401 before the network is fully up.
+# Retry a few times so the meter paints quickly instead of waiting a full
+# POLL_INTERVAL on whatever transient error happened at login.
+STARTUP_RETRIES = 4
+STARTUP_RETRY_INTERVAL = 4  # seconds between startup retries
+
+# Fallback refresh path. When our own OAuth refresh is rate limited (or the
+# stored refresh token is stale), we let Claude Code refresh instead.
+# Launching `claude` makes it renew its OAuth token at startup and write the
+# rotated credentials back to the Keychain — no prompt is sent, so no usage
+# is consumed. We feed EOF on stdin so the session exits right after init,
+# and cap it with a timeout so a hang can never wedge the menu bar.
+CLAUDE_REFRESH_ARGS = []      # bare `claude`; the refresh happens at startup
+CLAUDE_REFRESH_TIMEOUT = 20   # seconds (safety cap; it normally exits in ~1-3s)
+
 
 class NoTokenError(Exception):
     pass
@@ -46,18 +77,54 @@ class ReauthRequiredError(Exception):
     pass
 
 
+class RateLimitedError(Exception):
+    """Server returned 429. retry_after is seconds to wait, if provided."""
+
+    def __init__(self, retry_after=None):
+        self.retry_after = retry_after
+        msg = (f"rate limited (retry in ~{round(retry_after / 60)}m)"
+               if retry_after else "rate limited")
+        super().__init__(msg)
+
+
+def _parse_retry_after(headers):
+    """Pull an integer seconds value out of a Retry-After header."""
+    if not headers:
+        return None
+    val = headers.get("retry-after")
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_claude_bin():
+    """Locate the claude CLI even under launchd's minimal PATH."""
+    from shutil import which
+
+    found = which("claude")
+    if found:
+        return found
+    for candidate in CLAUDE_BIN_CANDIDATES:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def get_claude_code_version():
     """Detect installed Claude Code version for the User-Agent header."""
-    try:
-        result = subprocess.run(
-            ["claude", "--version"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            # Output is like "2.1.173 (Claude Code)"
-            return result.stdout.strip().split()[0]
-    except Exception:
-        pass
+    claude_bin = _find_claude_bin()
+    if claude_bin:
+        try:
+            result = subprocess.run(
+                [claude_bin, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                # Output is like "2.1.173 (Claude Code)"
+                return result.stdout.strip().split()[0]
+        except Exception:
+            pass
     return "2.1.0"  # fallback
 
 
@@ -129,18 +196,29 @@ def _keychain_write(data):
 
 
 def load_credentials():
-    """Return (container, oauth, write_fn) from the first available store.
+    """Return (container, oauth, write_fn) for the freshest available store.
 
     container is the full parsed JSON (what gets written back), oauth is
     the nested dict holding accessToken/refreshToken/expiresAt.
+
+    Both the legacy file and the Keychain can hold credentials at once. If
+    `claude` recently refreshed in one store, the other may carry a stale
+    token whose refresh token has already been rotated away. We pick the
+    store with the latest expiresAt so we always use the most recent token.
     """
+    best = (None, None, None)
+    best_expiry = -1
     for read_fn, write_fn in ((_file_read, _file_write),
                               (_keychain_read, _keychain_write)):
         container = read_fn()
         oauth = _extract_oauth(container)
-        if oauth:
-            return container, oauth, write_fn
-    return None, None, None
+        if not oauth:
+            continue
+        expiry = oauth.get("expiresAt") or 0
+        if expiry > best_expiry:
+            best_expiry = expiry
+            best = (container, oauth, write_fn)
+    return best
 
 
 def token_expired(oauth):
@@ -174,6 +252,10 @@ def refresh_credentials(container, oauth, write_fn):
         with urllib.request.urlopen(req, timeout=15) as resp:
             tok = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            # The token endpoint itself is rate limited. Hammering it is
+            # what gets us banned, so surface this and let the caller wait.
+            raise RateLimitedError(_parse_retry_after(e.headers)) from e
         if e.code in (400, 401, 403):
             raise ReauthRequiredError(
                 "refresh token rejected — run: claude /login"
@@ -186,6 +268,41 @@ def refresh_credentials(container, oauth, write_fn):
     if tok.get("expires_in"):
         oauth["expiresAt"] = int((time.time() + tok["expires_in"]) * 1000)
     write_fn(container)
+
+
+def refresh_via_claude(oauth_before):
+    """Let Claude Code refresh the token, as a fallback to our own refresh.
+
+    Launching `claude` makes it renew its OAuth token at startup and write
+    the rotated credentials back to the Keychain — without sending a prompt,
+    so it spends no usage. Claude Code holds the current (un-rotated) refresh
+    token and isn't subject to the same rate limit our direct refresh hit, so
+    this often succeeds when `refresh_credentials` is banned.
+
+    Returns True only if the stored access token actually advanced, i.e. a
+    real refresh happened. (If the token wasn't due, `claude` is a no-op and
+    this returns False — harmless, since we only call it when expired.)
+    """
+    claude_bin = _find_claude_bin()
+    if not claude_bin:
+        return False
+    before = (oauth_before or {}).get("expiresAt") or 0
+    try:
+        subprocess.run(
+            [claude_bin, *CLAUDE_REFRESH_ARGS],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=CLAUDE_REFRESH_TIMEOUT,
+        )
+    except Exception:
+        # A non-zero exit or a timeout doesn't mean failure: the refresh
+        # happens during startup, before the input loop, so the token may
+        # already be renewed. Fall through and judge by the stored value.
+        pass
+    _, oauth_after, _ = load_credentials()
+    after = (oauth_after or {}).get("expiresAt") or 0
+    return after > before
 
 
 # Detect version once at startup
@@ -207,7 +324,15 @@ def fetch_usage(token):
 
 
 def get_usage():
-    """Fetch usage, refreshing the access token when needed."""
+    """Fetch usage, refreshing the access token when needed.
+
+    The usage endpoint answers an *expired* token with a long 429 ban
+    (observed Retry-After ~1h) rather than a clean 401, so the cardinal
+    rule is: never call it with a token we already know is expired. We
+    refresh first, and we refresh at most once per call. If a refresh is
+    itself rate limited we raise RateLimitedError and let the app back off,
+    rather than falling through to a doomed request that deepens the ban.
+    """
     token = get_static_token()
     if token:
         return fetch_usage(token)
@@ -216,26 +341,37 @@ def get_usage():
     if not oauth:
         raise NoTokenError()
 
-    if token_expired(oauth) and oauth.get("refreshToken"):
-        try:
-            refresh_credentials(container, oauth, write_fn)
-        except ReauthRequiredError:
-            raise
-        except Exception:
-            # Transient failure (e.g. the endpoint rate-limits refresh
-            # attempts while the token is still valid). The stored token
-            # may still work — fall through and try it; a 401 below
-            # retries the refresh and surfaces the real error.
-            pass
+    if token_expired(oauth):
+        # Try our own cheap refresh first.
+        direct_error = None
+        if oauth.get("refreshToken"):
+            try:
+                refresh_credentials(container, oauth, write_fn)
+            except (RateLimitedError, ReauthRequiredError) as e:
+                direct_error = e
+        else:
+            direct_error = ReauthRequiredError(
+                "access token expired and no refresh token"
+            )
+
+        # If that failed (rate limited, or our stored refresh token is
+        # stale), let Claude Code refresh for us — no usage spent — then
+        # reload the credentials it just wrote.
+        if direct_error is not None:
+            if refresh_via_claude(oauth):
+                container, oauth, write_fn = load_credentials()
+            else:
+                raise direct_error
 
     try:
         return fetch_usage(oauth["accessToken"])
     except urllib.error.HTTPError as e:
-        # Token may have been revoked before its expiry timestamp;
-        # try one refresh and retry.
         if e.code == 401 and oauth.get("refreshToken"):
+            # Token was revoked before its expiry timestamp; refresh once.
             refresh_credentials(container, oauth, write_fn)
             return fetch_usage(oauth["accessToken"])
+        if e.code == 429:
+            raise RateLimitedError(_parse_retry_after(e.headers)) from e
         raise
 
 
@@ -293,6 +429,9 @@ class ClaudeUsageApp(rumps.App):
         self.title = "…"
         self.usage_data = None
         self.last_error = None
+        self._startup_attempt = 0
+        self._startup_timer = None
+        self._cooldown_until = 0  # epoch secs; skip requests until then
 
         # Info rows get a no-op callback: callback-less items are disabled
         # and macOS dims them (even re-enabling is undone by menu validation
@@ -302,24 +441,61 @@ class ClaudeUsageApp(rumps.App):
             rumps.MenuItem("Weekly Quota", callback=self._noop),
             None,
             rumps.MenuItem("Last Updated: never", callback=self._noop),
-            rumps.MenuItem("Refresh Now", callback=self.refresh, key="r"),
+            rumps.MenuItem("Refresh Now", callback=self.manual_refresh, key="r"),
             None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
 
         self.refresh(None)
+        # If the first attempt failed (stale token, network not up yet at
+        # login), retry quickly a few times instead of waiting 5 minutes.
+        if self.last_error is not None:
+            self._startup_timer = rumps.Timer(
+                self._startup_retry, STARTUP_RETRY_INTERVAL
+            )
+            self._startup_timer.start()
 
     def _noop(self, _):
         pass
+
+    def _startup_retry(self, sender):
+        self._startup_attempt += 1
+        self.refresh(None)
+        in_cooldown = time.time() < self._cooldown_until
+        # Stop the rapid startup retries on success, on a rate-limit cooldown
+        # (retrying fast would only deepen the ban — the 5-min poll takes over
+        # once the cooldown expires), or once attempts are exhausted.
+        if (self.last_error is None or in_cooldown
+                or self._startup_attempt >= STARTUP_RETRIES):
+            sender.stop()
 
     @rumps.timer(POLL_INTERVAL)
     def auto_refresh(self, _):
         self.refresh(None)
 
+    def manual_refresh(self, _):
+        """Refresh Now / Cmd-R: clear any cooldown and try immediately.
+
+        An explicit user action overrides the rate-limit backoff — handy
+        right after running `claude`, which may have just written a fresh
+        token that the cooldown would otherwise make us ignore.
+        """
+        self._cooldown_until = 0
+        self.refresh(None)
+
     def refresh(self, _):
+        # Honor an active rate-limit cooldown: hitting the endpoint again
+        # before Retry-After elapses only extends the ban.
+        if time.time() < self._cooldown_until:
+            mins = max(1, round((self._cooldown_until - time.time()) / 60))
+            self.title = "rate-limited"
+            self.last_error = f"Rate limited — auto-retry in ~{mins}m"
+            self._update_menu_error()
+            return
         try:
             self.usage_data = get_usage()
             self.last_error = None
+            self._cooldown_until = 0
             self._update_display()
         except NoTokenError:
             self.title = "No token"
@@ -331,6 +507,15 @@ class ClaudeUsageApp(rumps.App):
         except ReauthRequiredError as e:
             self.title = "re-auth"
             self.last_error = str(e)
+            self._update_menu_error()
+        except RateLimitedError as e:
+            # Wait out the server's Retry-After (default 15m if unspecified),
+            # capped so a huge value can't wedge the app for hours.
+            wait = min(e.retry_after or 900, 3600)
+            self._cooldown_until = time.time() + wait
+            mins = max(1, round(wait / 60))
+            self.title = "rate-limited"
+            self.last_error = f"Rate limited — auto-retry in ~{mins}m"
             self._update_menu_error()
         except urllib.error.HTTPError as e:
             self.last_error = f"HTTP {e.code}"
@@ -413,7 +598,172 @@ class ClaudeUsageApp(rumps.App):
         )
 
 
+def run_diagnostic():
+    """Print exactly what the app sees, without starting the menu bar.
+
+    Run with:  python3 claude_menubar.py --check
+    Tokens themselves are never printed.
+    """
+    print("=== claude-usage-menubar diagnostic ===")
+    print(f"python:          {sys.executable}")
+    print(f"claude binary:   {_find_claude_bin() or 'NOT FOUND on PATH or known locations'}")
+    print(f"User-Agent:      claude-code/{_CC_VERSION}")
+
+    if get_static_token():
+        print("credentials:     static token (env/config) — no auto-refresh")
+        oauth = None
+        container = write_fn = None
+    else:
+        container, oauth, write_fn = load_credentials()
+        if not oauth:
+            print("credentials:     NONE found in file or Keychain")
+            print("\nRun: claude /login  (select 'Claude account with subscription')")
+            return
+        src = "file" if _extract_oauth(_file_read()) is oauth else "keychain"
+        print(f"credentials:     loaded from {src} (freshest of the two)")
+        exp = oauth.get("expiresAt")
+        if exp:
+            secs = exp / 1000 - time.time()
+            print(f"expiresAt:       {datetime.fromtimestamp(exp/1000)} "
+                  f"({secs/3600:+.1f}h from now)")
+        else:
+            print("expiresAt:       (missing)")
+        print(f"token_expired:   {token_expired(oauth)}")
+        print(f"has refresh tok: {bool(oauth.get('refreshToken'))}")
+
+    token = get_static_token() or (oauth or {}).get("accessToken")
+    print("\n--- raw usage request ---")
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": f"claude-code/{_CC_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"HTTP {resp.status} OK")
+            print(resp.read().decode()[:400])
+            return
+    except urllib.error.HTTPError as e:
+        print(f"HTTP {e.code} {e.reason}")
+        print(f"retry-after:     {e.headers.get('retry-after')}")
+        print(f"x-ratelimit:     {e.headers.get('anthropic-ratelimit-unified-status')}")
+        body = e.read().decode()[:600]
+        print(f"body:            {body}")
+    except Exception as e:
+        print(f"request failed: {e}")
+        return
+
+    if oauth and oauth.get("refreshToken"):
+        print("\n--- attempting token refresh ---")
+        try:
+            refresh_credentials(container, oauth, write_fn)
+            print("refresh: OK (new token written)")
+            with urllib.request.urlopen(
+                urllib.request.Request(
+                    USAGE_URL,
+                    headers={
+                        "Authorization": f"Bearer {oauth['accessToken']}",
+                        "anthropic-beta": "oauth-2025-04-20",
+                        "User-Agent": f"claude-code/{_CC_VERSION}",
+                    },
+                ),
+                timeout=10,
+            ) as resp:
+                print(f"retry usage: HTTP {resp.status} OK — self-heal works")
+        except RateLimitedError as e:
+            print(f"refresh rate limited: {e}")
+            print("  -> the token endpoint is banned right now; the app will "
+                  "wait out the cooldown and refresh automatically. No manual "
+                  "`claude` run needed once the window clears.")
+        except urllib.error.HTTPError as e:
+            print(f"refresh/retry HTTP {e.code} {e.reason}")
+            print(f"retry-after: {e.headers.get('retry-after')}")
+            print(f"body: {e.read().decode()[:600]}")
+        except ReauthRequiredError as e:
+            print(f"refresh rejected: {e}")
+        except Exception as e:
+            print(f"refresh failed: {e}")
+
+
+def test_claude_refresh():
+    """Exercise the Claude-Code fallback refresh in isolation.
+
+    Run with:  python3 claude_menubar.py --claude-refresh
+    Note: if your token is still fresh, `claude` won't refresh it (it only
+    renews when due), so 'advanced: False' here just means 'nothing to do',
+    not that the mechanism is broken.
+    """
+    claude_bin = _find_claude_bin()
+    print(f"claude binary:   {claude_bin or 'NOT FOUND'}")
+    if not claude_bin:
+        return
+    _, oauth, _ = load_credentials()
+    before = (oauth or {}).get("expiresAt") or 0
+    print(f"expiresAt before: {datetime.fromtimestamp(before/1000) if before else '—'}")
+    t0 = time.time()
+    advanced = refresh_via_claude(oauth)
+    print(f"claude ran in:   {time.time() - t0:.1f}s")
+    _, oauth2, _ = load_credentials()
+    after = (oauth2 or {}).get("expiresAt") or 0
+    print(f"expiresAt after: {datetime.fromtimestamp(after/1000) if after else '—'}")
+    print(f"token advanced:  {advanced}")
+
+
+def test_expired_refresh():
+    """Prove the claude fallback against an actually-expired token.
+
+    Run with:  python3 claude_menubar.py --test-expired-refresh
+    Safe and reversible: it only rewrites the `expiresAt` *timestamp*, never
+    the token itself. If `claude` refreshes (rotating to a new token), we keep
+    it. If it doesn't, we restore the original timestamp. Worst case, your
+    real token still works and `claude /login` would reset everything anyway.
+    """
+    if get_static_token():
+        print("Using a static token (env/config); nothing to refresh.")
+        return
+    container, oauth, write_fn = load_credentials()
+    if not oauth:
+        print("No OAuth credentials found.")
+        return
+    orig = oauth.get("expiresAt")
+    print(f"real expiresAt:   {datetime.fromtimestamp(orig/1000) if orig else '—'}")
+
+    # Temporarily backdate the timestamp so claude considers it due.
+    oauth["expiresAt"] = int((time.time() - 3600) * 1000)
+    write_fn(container)
+    print("marked token as expired (timestamp only); launching claude...")
+
+    t0 = time.time()
+    advanced = refresh_via_claude(oauth)
+    print(f"claude ran in:    {time.time() - t0:.1f}s")
+
+    _, oauth2, _ = load_credentials()
+    new_exp = (oauth2 or {}).get("expiresAt")
+    if advanced:
+        print(f"new expiresAt:    {datetime.fromtimestamp(new_exp/1000)}")
+        print("RESULT: claude refreshed the expired token — the fallback WORKS.")
+    else:
+        oauth["expiresAt"] = orig
+        write_fn(container)
+        print("RESULT: claude did NOT refresh; restored original timestamp.")
+        print("        The bare `claude` invocation skips refresh when "
+              "non-interactive. Consider adjusting CLAUDE_REFRESH_ARGS.")
+
+
 if __name__ == "__main__":
+    if "--check" in sys.argv:
+        run_diagnostic()
+        sys.exit(0)
+    if "--claude-refresh" in sys.argv:
+        test_claude_refresh()
+        sys.exit(0)
+    if "--test-expired-refresh" in sys.argv:
+        test_expired_refresh()
+        sys.exit(0)
+
     # Hide the Python rocket icon from the Dock
     try:
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory

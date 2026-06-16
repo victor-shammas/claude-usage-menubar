@@ -73,7 +73,11 @@ Most users don't need to do anything — if Claude Code is installed and logged 
 
 ### Token auto-refresh
 
-Claude Code's OAuth access tokens expire after ~8 hours, and normally only Claude Code itself renews them. For sources 3 and 4 the app renews the token itself when it expires (or when a request comes back 401), using the refresh token stored alongside it, and writes the rotated credentials back to the same store so Claude Code stays logged in. This means the widget keeps working even when you haven't opened Claude Code in days.
+Claude Code's OAuth access tokens expire after ~8 hours, and normally only Claude Code itself renews them. For sources 3 and 4 the app renews the token itself when it expires, using the refresh token stored alongside it, and writes the rotated credentials back to the same store so Claude Code stays logged in. When both the file and the Keychain hold credentials, the app uses whichever has the most recent token.
+
+Crucially, the app never calls the usage endpoint with a token it already knows is expired — that earns a long rate-limit ban (the endpoint answers an expired token with a `429` and a `Retry-After` up to an hour, not a clean `401`). It refreshes *first*, exactly once, and backs off on any `429`.
+
+If its own refresh is rate limited (or its stored refresh token is stale), it falls back to launching `claude` in the background. Claude Code renews its OAuth token at startup — without a prompt, so no usage is consumed — and writes the fresh token to the Keychain, which the app then picks up. This is the automated version of the old "run `claude` once in a terminal" trick. The result: the widget self-heals on first launch and across logins, without you ever opening a terminal.
 
 Sources 1 and 2 are static tokens with no refresh token, so they still go stale — the app will show `err:401` when they do.
 
@@ -115,13 +119,44 @@ The refresh token was rejected, so the app can't renew your access token. Re-aut
 
 Your token is expired or invalid and couldn't be auto-refreshed (this is expected for static tokens from `CLAUDE_OAUTH_TOKEN` or `~/.claude_menubar.json`). Re-authenticate with `claude /login`, or update your static token.
 
-**"err:429"**
+**"rate-limited"**
 
-Rate limited. This usually happens if you restart the app many times in quick succession. Wait a few minutes and it will recover on the next auto-refresh.
+The usage endpoint returns a 429 ban (sometimes for nearly an hour) if it's hit with an *expired* access token, so the app never does that anymore — when the token is expired it refreshes first, and it refreshes at most once. If a refresh or usage call still comes back 429, the app reads the `Retry-After` header, shows `Rate limited — auto-retry in ~Nm`, and waits out the cooldown before trying again instead of polling into a deeper ban. It clears itself with no terminal needed. If you're stuck in a long cooldown, it's usually the residue of an earlier hammering loop — just wait it out once and it stays healthy.
+
+To check exactly what the endpoint is returning at any moment:
+
+```bash
+python3 claude_menubar.py --check
+```
+
+This prints the credential source, token expiry, the User-Agent, and the raw HTTP status/body — without starting the menu bar or printing your token.
 
 **Python Dock icon showing**
 
 Install `pyobjc-framework-Cocoa` (included in `requirements.txt`). The app uses it to hide the Dock icon. If it's not installed, everything works but you'll see the Python rocket in the Dock.
+
+## Changelog
+
+### v1.1.1
+
+- **Fixed the first-launch `429` rate-limit ban.** The app no longer calls the usage endpoint with a token it already knows is expired (the endpoint answers an expired token with a long `429` ban, up to an hour, rather than a clean `401`). It now refreshes the token *first*, refreshes at most once, and on any `429` it reads `Retry-After` and backs off instead of polling into a deeper ban.
+- **Added a background `claude` fallback refresh.** If the app's own OAuth refresh is rate limited or its stored refresh token is stale, it launches `claude` to refresh the token (no prompt, no usage spent) and picks up the rotated token from the Keychain — the automated version of the old "run `claude` once in a terminal" trick.
+- **Robust `claude` detection under launchd.** Probes common install locations so the `User-Agent` carries a real `claude-code` version even when launched at login with a minimal `PATH`.
+- **Picks the freshest credential store** when both the file and the Keychain hold tokens.
+- **Manual refresh bypasses the cooldown** (Refresh Now / Cmd-R) for an immediate re-check.
+- **New diagnostic flags:** `--check`, `--claude-refresh`, and `--test-expired-refresh`.
+
+### v1.1.0
+
+- Auto-refresh expired OAuth tokens using the stored refresh token.
+
+### v1.0.1
+
+- Fix bar clamping and pip/interpreter mismatch; update dropdown screenshot.
+
+### v1.0.0
+
+- Initial release: Claude usage menu bar widget for macOS.
 
 ## License
 
