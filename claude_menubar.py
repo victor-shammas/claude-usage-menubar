@@ -436,15 +436,20 @@ class ClaudeUsageApp(rumps.App):
         # Info rows get a no-op callback: callback-less items are disabled
         # and macOS dims them (even re-enabling is undone by menu validation
         # at popup time, since they have no action).
+        self._reauth_item = rumps.MenuItem(
+            "Re-authenticate...", callback=self._launch_login, key="l",
+        )
         self.menu = [
             rumps.MenuItem("5-Hour Window", callback=self._noop),
             rumps.MenuItem("Weekly Quota", callback=self._noop),
             None,
             rumps.MenuItem("Last Updated: never", callback=self._noop),
             rumps.MenuItem("Refresh Now", callback=self.manual_refresh, key="r"),
+            self._reauth_item,
             None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
+        self._set_reauth_visible(False)
 
         self.refresh(None)
         # If the first attempt failed (stale token, network not up yet at
@@ -457,6 +462,43 @@ class ClaudeUsageApp(rumps.App):
 
     def _noop(self, _):
         pass
+
+    def _set_reauth_visible(self, visible):
+        try:
+            self._reauth_item._menuitem.setHidden_(not visible)
+        except Exception:
+            pass
+
+    def _launch_login(self, _):
+        """Open Terminal and run `claude /login` so the user can re-authenticate."""
+        claude_bin = _find_claude_bin() or "claude"
+        script = (
+            f'tell application "Terminal"\n'
+            f'  activate\n'
+            f'  do script "{claude_bin} /login"\n'
+            f'end tell'
+        )
+        try:
+            subprocess.Popen(
+                ["osascript", "-e", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        # Poll for fresh credentials after the user completes the browser flow.
+        self._login_poll_count = 0
+        if getattr(self, "_login_timer", None):
+            self._login_timer.stop()
+        self._login_timer = rumps.Timer(self._poll_after_login, 5)
+        self._login_timer.start()
+
+    def _poll_after_login(self, sender):
+        """Check periodically whether login wrote fresh credentials."""
+        self._login_poll_count += 1
+        self.refresh(None)
+        if self.last_error is None or self._login_poll_count >= 24:
+            sender.stop()
 
     def _startup_retry(self, sender):
         self._startup_attempt += 1
@@ -496,17 +538,19 @@ class ClaudeUsageApp(rumps.App):
             self.usage_data = get_usage()
             self.last_error = None
             self._cooldown_until = 0
+            self._set_reauth_visible(False)
             self._update_display()
         except NoTokenError:
             self.title = "No token"
             self.last_error = (
-                "No OAuth token found. Log in with: claude /login "
-                "(select 'Claude account with subscription')"
+                "No OAuth token found — click Re-authenticate"
             )
+            self._set_reauth_visible(True)
             self._update_menu_error()
         except ReauthRequiredError as e:
             self.title = "re-auth"
             self.last_error = str(e)
+            self._set_reauth_visible(True)
             self._update_menu_error()
         except RateLimitedError as e:
             # Wait out the server's Retry-After (default 15m if unspecified),
