@@ -103,17 +103,11 @@ Edit these constants at the top of `claude_menubar.py`:
 
 **"No token" in menu bar**
 
-You're not logged into Claude Code via OAuth. Run:
-
-```
-claude /login
-```
-
-Select **"Claude account with subscription"** (option 1). This requires a Pro, Max, Team, or Enterprise plan.
+You're not logged into Claude Code via OAuth. Click **Re-authenticate... (Cmd+L)** in the dropdown — it opens Terminal and runs `claude /login` for you. Select **"Claude account with subscription"** (option 1). This requires a Pro, Max, Team, or Enterprise plan. The app auto-refreshes once login completes.
 
 **"re-auth" in menu bar**
 
-The refresh token was rejected, so the app can't renew your access token. Re-authenticate with `claude /login`.
+The refresh token was rejected, so the app can't renew your access token. Click **Re-authenticate... (Cmd+L)** in the dropdown to re-login.
 
 **"err:401" or "err:403"**
 
@@ -136,6 +130,10 @@ This prints the credential source, token expiry, the User-Agent, and the raw HTT
 Install `pyobjc-framework-Cocoa` (included in `requirements.txt`). The app uses it to hide the Dock icon. If it's not installed, everything works but you'll see the Python rocket in the Dock.
 
 ## Changelog
+
+### v1.2.0
+
+- **One-click re-authentication from the menu bar.** When the token expires with no refresh token (or no credentials exist), a **Re-authenticate... (Cmd+L)** button appears in the dropdown. It opens Terminal and runs `claude /login` automatically. After the user completes the browser OAuth flow, the app polls for fresh credentials and auto-refreshes — no manual Cmd+R needed. The button hides itself once credentials are healthy.
 
 ### v1.1.1
 
