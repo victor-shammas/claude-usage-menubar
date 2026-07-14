@@ -4,10 +4,11 @@ A macOS menu bar widget that shows your Claude usage quota at a glance.
 
 ![menu bar screenshot](screenshots/menubar.png)
 
-Shows two numbers in your menu bar:
+Shows your usage at a glance in the menu bar:
 
 - **5h** — the 5-hour rolling window (how much you've used in the current session window)
 - **7d** — the 7-day weekly quota (cumulative usage over the past week)
+- **F5** — the weekly cap for a specific model (e.g. Fable 5), shown only when your plan enforces one
 
 Click it to see progress bars and time until each window resets.
 
@@ -83,7 +84,7 @@ Sources 1 and 2 are static tokens with no refresh token, so they still go stale 
 
 ## How it works
 
-The app polls an undocumented Anthropic endpoint (`api.anthropic.com/api/oauth/usage`) every 5 minutes. This is the same endpoint Claude Code's internal HUD uses. It returns utilization percentages for the 5-hour rolling window and 7-day weekly cap.
+The app polls an undocumented Anthropic endpoint (`api.anthropic.com/api/oauth/usage`) every 5 minutes. This is the same endpoint Claude Code's internal HUD uses. It returns utilization percentages for the 5-hour rolling window and 7-day weekly cap, plus any per-model weekly caps (such as Fable 5) that apply to your plan. The 5-hour and 7-day figures are top-level fields; per-model caps arrive inside the response's `limits` array as `weekly_scoped` entries tagged with the model's display name, which is where the app reads the Fable 5 meter from.
 
 ### Caveats
 
@@ -130,6 +131,10 @@ This prints the credential source, token expiry, the User-Agent, and the raw HTT
 Install `pyobjc-framework-Cocoa` (included in `requirements.txt`). The app uses it to hide the Dock icon. If it's not installed, everything works but you'll see the Python rocket in the Dock.
 
 ## Changelog
+
+### v1.3.0
+
+- **Added a third meter: per-model weekly cap.** When your plan enforces a model-specific weekly limit (e.g. Fable 5), a third row appears in the dropdown and an `F5:NN%` indicator is appended to the menu-bar title. Both are shown only when the usage response actually carries that scoped limit, so accounts without one are unaffected — no empty row, unchanged title. The value is read from the `limits` array of the usage endpoint (a `weekly_scoped` entry tagged with the model's display name), since per-model caps aren't exposed as top-level fields like `five_hour`/`seven_day`.
 
 ### v1.2.0
 

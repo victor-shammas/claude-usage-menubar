@@ -423,6 +423,45 @@ def bar(utilization, width=20):
     return "█" * used + "░" * (width - used)
 
 
+def scoped_limit(data, model_name):
+    """Return the weekly per-model cap for model_name, or None if absent.
+
+    Per-model weekly limits (e.g. Fable) aren't surfaced as top-level fields
+    the way five_hour/seven_day are. They arrive inside the `limits` array as
+    `weekly_scoped` entries tagged with scope.model.display_name. We normalize
+    the match to the same {utilization, resets_at} shape the top-level quota
+    blocks use, so the format/render helpers work on it unchanged. The match
+    is a case-insensitive substring so "Fable" and a future "Fable 5" both hit.
+    """
+    needle = model_name.lower()
+    for lim in data.get("limits") or []:
+        if lim.get("kind") != "weekly_scoped":
+            continue
+        model = (lim.get("scope") or {}).get("model") or {}
+        name = (model.get("display_name") or "").lower()
+        if needle in name:
+            return {
+                "utilization": lim.get("percent") or 0,
+                "resets_at": lim.get("resets_at", ""),
+            }
+    return None
+
+
+def format_row(label, block):
+    """Build one aligned meter line for a quota block.
+
+    block carries 'utilization' (0–100) and 'resets_at' (ISO-8601). The label
+    is padded to the width of the longest label so the bars line up under the
+    monospaced attributed title set in _set_item_title.
+    """
+    util = block.get("utilization") or 0
+    used = pct_used(util)
+    reset = format_time_remaining(block.get("resets_at", ""))
+    label_col = f"{label}:".ljust(14)  # 14 = len("5-Hour Window:"), the widest
+    return (f"{status_dot(util)} {label_col}  {bar(util, 15)}  "
+            f"{used}% used  (resets in {reset})")
+
+
 class ClaudeUsageApp(rumps.App):
     def __init__(self):
         super().__init__("Claude Usage", quit_button=None)
@@ -439,9 +478,14 @@ class ClaudeUsageApp(rumps.App):
         self._reauth_item = rumps.MenuItem(
             "Re-authenticate...", callback=self._launch_login, key="l",
         )
+        # Per-model weekly cap (e.g. Fable). Shown only when the usage
+        # response actually carries a scoped limit for it, so accounts
+        # without one never get a dangling empty row.
+        self._fable_item = rumps.MenuItem("Fable 5", callback=self._noop)
         self.menu = [
             rumps.MenuItem("5-Hour Window", callback=self._noop),
             rumps.MenuItem("Weekly Quota", callback=self._noop),
+            self._fable_item,
             None,
             rumps.MenuItem("Last Updated: never", callback=self._noop),
             rumps.MenuItem("Refresh Now", callback=self.manual_refresh, key="r"),
@@ -450,6 +494,7 @@ class ClaudeUsageApp(rumps.App):
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
         self._set_reauth_visible(False)
+        self._set_fable_visible(False)
 
         self.refresh(None)
         # If the first attempt failed (stale token, network not up yet at
@@ -466,6 +511,12 @@ class ClaudeUsageApp(rumps.App):
     def _set_reauth_visible(self, visible):
         try:
             self._reauth_item._menuitem.setHidden_(not visible)
+        except Exception:
+            pass
+
+    def _set_fable_visible(self, visible):
+        try:
+            self._fable_item._menuitem.setHidden_(not visible)
         except Exception:
             pass
 
@@ -606,28 +657,25 @@ class ClaudeUsageApp(rumps.App):
         d = self.usage_data
         five = d.get("five_hour", {})
         week = d.get("seven_day", {})
+        fable = scoped_limit(d, "Fable")
 
-        five_util = five.get("utilization", 0)
-        week_util = week.get("utilization", 0)
+        five_used = pct_used(five.get("utilization") or 0)
+        week_used = pct_used(week.get("utilization") or 0)
 
-        five_used = pct_used(five_util)
-        week_used = pct_used(week_util)
+        # Only advertise Fable in the always-visible menu-bar title when the
+        # account has a Fable cap; otherwise keep the original two-meter title.
+        if fable is not None:
+            fable_used = pct_used(fable.get("utilization") or 0)
+            self.title = f"5h:{five_used}%  7d:{week_used}%  F5:{fable_used}%"
+        else:
+            self.title = f"5h:{five_used}%  7d:{week_used}%"
 
-        self.title = f"5h:{five_used}%  7d:{week_used}%"
+        self._set_item_title("5-Hour Window", format_row("5-Hour Window", five))
+        self._set_item_title("Weekly Quota", format_row("Weekly Quota", week))
 
-        five_reset = format_time_remaining(five.get("resets_at", ""))
-        week_reset = format_time_remaining(week.get("resets_at", ""))
-
-        self._set_item_title(
-            "5-Hour Window",
-            f"{status_dot(five_util)} 5-Hour Window:  {bar(five_util, 15)}  "
-            f"{five_used}% used  (resets in {five_reset})",
-        )
-        self._set_item_title(
-            "Weekly Quota",
-            f"{status_dot(week_util)} Weekly Quota:   {bar(week_util, 15)}  "
-            f"{week_used}% used  (resets in {week_reset})",
-        )
+        self._set_fable_visible(fable is not None)
+        if fable is not None:
+            self._set_item_title("Fable 5", format_row("Fable 5", fable))
 
         now = datetime.now().strftime("%H:%M")
         self._set_item_title("Last Updated: never", f"Last Updated: {now}")
@@ -636,6 +684,9 @@ class ClaudeUsageApp(rumps.App):
         err = self.last_error or "Unknown error"
         self._set_item_title("5-Hour Window", f"Error: {err}")
         self._set_item_title("Weekly Quota", "—")
+        # Harmless when the row is hidden; blanks it if a Fable account
+        # errors after a prior successful fetch left real numbers showing.
+        self._set_item_title("Fable 5", "—")
         now = datetime.now().strftime("%H:%M")
         self._set_item_title(
             "Last Updated: never", f"Last Updated: {now} (error)"
